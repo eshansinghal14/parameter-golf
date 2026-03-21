@@ -8,5 +8,5 @@ typing-extensions==4.15.0
 datasets
 tiktoken
 sentencepiece
-rustbpe
+rustbpe @ git+https://github.com/eshansinghal14/rustbpe.git@master
 tokenizers
