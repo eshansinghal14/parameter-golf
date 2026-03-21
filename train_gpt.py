@@ -41,6 +41,7 @@ class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
+    # SentencePiece: path to *.model. Rust BPE (tokenizer.py): directory with tokenizer.pkl + token_bytes.pt.
     tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
@@ -202,6 +203,20 @@ def build_sentencepiece_luts(
         torch.tensor(has_leading_space_np, dtype=torch.bool, device=device),
         torch.tensor(is_boundary_token_np, dtype=torch.bool, device=device),
     )
+
+
+def build_token_bytes_luts(token_bytes_path: Path, vocab_size: int, device: torch.device) -> tuple[Tensor, Tensor, Tensor]:
+    """BPB LUTs from tok_train.py output (per-token UTF-8 byte counts; specials are 0)."""
+    tb = torch.load(token_bytes_path, map_location="cpu", weights_only=True)
+    if tb.ndim != 1:
+        raise ValueError(f"token_bytes.pt must be 1D, got shape {tuple(tb.shape)}")
+    n = int(tb.numel())
+    if n != vocab_size:
+        raise ValueError(f"token_bytes.pt length {n} != VOCAB_SIZE={vocab_size}")
+    base = tb.to(dtype=torch.int16, device=device)
+    has_leading = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+    is_boundary = torch.ones(vocab_size, dtype=torch.bool, device=device)
+    return base, has_leading, is_boundary
 
 
 def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
@@ -802,20 +817,43 @@ def main() -> None:
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
-    if not args.tokenizer_path.endswith(".model"):
-        raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
-    sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
-    if int(sp.vocab_size()) != args.vocab_size:
+    tok_path = Path(args.tokenizer_path).expanduser()
+    custom_tok = tok_path / "tokenizer.pkl"
+    token_bytes_pt = tok_path / "token_bytes.pt"
+    if tok_path.is_file() and str(args.tokenizer_path).endswith(".model"):
+        sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
+        if int(sp.vocab_size()) != args.vocab_size:
+            raise ValueError(
+                f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
+            )
+        base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
+            sp, args.vocab_size, device
+        )
+        log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
+    elif tok_path.is_dir() and custom_tok.is_file():
+        from tokenizer import RustBPETokenizer
+
+        rt = RustBPETokenizer.from_directory(str(tok_path.resolve()))
+        if int(rt.get_vocab_size()) != args.vocab_size:
+            raise ValueError(
+                f"VOCAB_SIZE={args.vocab_size} does not match RustBPETokenizer vocab {int(rt.get_vocab_size())}"
+            )
+        if not token_bytes_pt.is_file():
+            raise ValueError(
+                f"Custom tokenizer directory must contain token_bytes.pt (run tok_train.py). Missing: {token_bytes_pt}"
+            )
+        base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_token_bytes_luts(
+            token_bytes_pt, args.vocab_size, device
+        )
+        log0(f"val_bpb:enabled tokenizer_kind=rust_bpe tokenizer_path={args.tokenizer_path}")
+    else:
         raise ValueError(
-            f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
+            "TOKENIZER_PATH must be a SentencePiece .model file or a directory containing "
+            f"tokenizer.pkl and token_bytes.pt. Got: {args.tokenizer_path}"
         )
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
-    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
-        sp, args.vocab_size, device
-    )
-    log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
