@@ -119,6 +119,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Also download docs_selected.jsonl and its sidecar for tokenizer retraining or dataset re-export.",
     )
     parser.add_argument(
+        "--docs-only",
+        action="store_true",
+        help="Only download docs_selected.jsonl and docs_selected.source_manifest.json (no .bin shards or tokenizer files).",
+    )
+    parser.add_argument(
         "--data-root",
         type=Path,
         default=None,
@@ -132,6 +137,12 @@ def main() -> None:
     args = build_parser().parse_args()
     if args.data_root is not None:
         set_data_root(args.data_root)
+
+    if args.docs_only:
+        get(f"{REMOTE_ROOT_PREFIX}/docs_selected.jsonl")
+        get(f"{REMOTE_ROOT_PREFIX}/docs_selected.source_manifest.json")
+        return
+
     dataset_dir = dataset_dir_for_variant(args.variant)
     train_shards = args.train_shards
     if train_shards < 0:
