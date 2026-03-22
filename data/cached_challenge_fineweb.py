@@ -98,13 +98,6 @@ def artifact_paths_for_tokenizer(tokenizer_entry: dict) -> list[str]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Download challenge FineWeb shards from Hugging Face")
     parser.add_argument(
-        "train_shards_positional",
-        nargs="?",
-        type=int,
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
         "--train-shards",
         type=int,
         default=80,
@@ -140,7 +133,7 @@ def main() -> None:
     if args.data_root is not None:
         set_data_root(args.data_root)
     dataset_dir = dataset_dir_for_variant(args.variant)
-    train_shards = args.train_shards_positional if args.train_shards_positional is not None else args.train_shards
+    train_shards = args.train_shards
     if train_shards < 0:
         raise ValueError("train_shards must be non-negative")
 
