@@ -68,6 +68,8 @@ class Hyperparameters:
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
+    # 0 = full token embedding (vocab × model_dim). 0 < emb_rank < model_dim factors as (vocab × r) + (r × model_dim).
+    emb_rank = int(os.environ.get("EMB_RANK", "0"))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
@@ -674,6 +676,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        emb_rank: int = 0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -681,7 +684,17 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
-        self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.model_dim = model_dim
+        self.emb_rank = emb_rank
+        self.low_rank_embed = 0 < emb_rank < model_dim
+        if self.low_rank_embed:
+            self.tok_emb = nn.Embedding(vocab_size, emb_rank)
+            self.tok_emb_up = nn.Linear(emb_rank, model_dim, bias=False)
+        else:
+            if emb_rank != 0 and emb_rank >= model_dim:
+                raise ValueError(f"EMB_RANK={emb_rank} must be 0 (full) or in (0, MODEL_DIM={model_dim})")
+            self.tok_emb = nn.Embedding(vocab_size, model_dim)
+            self.tok_emb_up = None
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -708,12 +721,17 @@ class GPT(nn.Module):
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+            if self.tok_emb_up is not None:
+                nn.init.normal_(self.tok_emb_up.weight, mean=0.0, std=self.tied_embed_init_std)
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        x = self.tok_emb(input_ids)
+        if self.tok_emb_up is not None:
+            x = self.tok_emb_up(self.tok_emb(input_ids))
+        else:
+            x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
@@ -730,7 +748,12 @@ class GPT(nn.Module):
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
+            if self.tok_emb_up is not None:
+                # W = E @ P with E (V,r), P = tok_emb_up.weight (d,r) as (r,d) in multiply: h @ P^T then @ E^T
+                intermediate = x @ self.tok_emb_up.weight
+                logits_proj = F.linear(intermediate, self.tok_emb.weight)
+            else:
+                logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
@@ -873,6 +896,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        emb_rank=args.emb_rank,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -900,8 +924,11 @@ def main() -> None:
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    tok_params = [base_model.tok_emb.weight]
+    if base_model.tok_emb_up is not None:
+        tok_params.append(base_model.tok_emb_up.weight)
     optimizer_tok = torch.optim.Adam(
-        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
+        [{"params": tok_params, "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -936,7 +963,7 @@ def main() -> None:
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
-        f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
+        f"tie_embeddings:{args.tie_embeddings} emb_rank:{args.emb_rank} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
